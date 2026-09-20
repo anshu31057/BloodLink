@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
-import * as maplibregl from 'maplibre-gl';
+import mapboxgl from '../../services/mapbox';
+import 'mapbox-gl/dist/mapbox-gl.css';
 import { 
   Navigation, 
   MapPin, 
@@ -22,7 +23,100 @@ import {
 import { useCommandCenter } from '../../context/CommandCenterContext';
 import { BloodGroupBadge } from '../common/BloodGroupBadge';
 import { Donor } from '../../types';
-import { useDonorLocations } from '../../hooks/useSupabaseData';
+import { EmergencyRequest, HospitalProfile } from '../../types';
+import { fetchBloodRequests, fetchHospitalProfile } from '../../services/supabaseQueries';
+import { isLiveSupabaseConfigured, supabase } from '../../services/supabaseClient';
+
+interface DonorRow {
+  donor_id: string;
+  full_name?: string | null;
+  name?: string | null;
+  blood_group: Donor['bloodGroup'];
+  latitude: number;
+  longitude: number;
+  availability: boolean;
+  phone?: string | null;
+  vehicle_type?: string | null;
+}
+
+const isCoordinate = (value: number): boolean => Number.isFinite(value);
+
+const toMapDonor = (row: DonorRow): Donor => ({
+  id: row.donor_id,
+  name: row.full_name || row.name || 'Available Donor',
+  avatar: '',
+  bloodGroup: row.blood_group,
+  phone: row.phone || '',
+  emergencyContact: '',
+  distanceKm: 0,
+  etaMinutes: 0,
+  status: 'RESPONDED',
+  statusUpdatedMinutesAgo: 0,
+  vehicleType: row.vehicle_type === 'Car' || row.vehicle_type === 'Metro/Walk' ? row.vehicle_type : 'Bike',
+  latitude: row.latitude,
+  longitude: row.longitude,
+  totalDonations: 0,
+  verifiedDonor: true,
+  requestId: ''
+});
+
+const priorityColor = (priority: string): string => {
+  if (priority === 'URGENT') return '#F97316';
+  if (priority === 'NORMAL') return '#2563EB';
+  return '#DC2626';
+};
+
+const distanceKm = (lat1: number, lon1: number, lat2: number, lon2: number): number => {
+  const earthRadiusKm = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+  return earthRadiusKm * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+};
+
+interface LineFeature {
+  type: 'Feature';
+  geometry: {
+    type: 'LineString';
+    coordinates: [number, number][];
+  };
+  properties: Record<string, never>;
+}
+
+const routeFeature = (donor: Donor | undefined, hospitalCoords: [number, number]): LineFeature => ({
+  type: 'Feature',
+  geometry: {
+    type: 'LineString',
+    coordinates: donor
+      ? [[donor.longitude, donor.latitude], hospitalCoords]
+      : [hospitalCoords, hospitalCoords]
+  },
+  properties: {}
+});
+
+const hospitalPopup = (hospital: HospitalProfile): string => `
+  <strong>${hospital.name}</strong><br />
+  Verified Emergency Network Node<br />
+  ${hospital.city}<br />
+  Emergency Hotline: ${hospital.emergencyHotline}
+`;
+
+const donorPopup = (donor: Donor, hospital: HospitalProfile): string => `
+  <strong>${donor.name}</strong><br />
+  Blood Group: ${donor.bloodGroup}<br />
+  Distance from hospital: ${donor.distanceKm || 'Live route'} km<br />
+  Availability: Available<br />
+  ETA: ${donor.etaMinutes || 'Calculating'} min
+`;
+
+const sosPopup = (request: EmergencyRequest): string => `
+  <strong>Emergency SOS</strong><br />
+  ${request.hospitalName}<br />
+  Priority: ${request.priority}<br />
+  Radius: ${request.broadcastRadiusKm} km<br />
+  Status: ${request.status}
+`;
 
 // Helper to generate a circle GeoJSON polygon for geofence visual
 function createGeoJSONCircle(center: [number, number], radiusInKm: number, points = 64) {
@@ -64,8 +158,11 @@ export const LiveMapPage: React.FC = () => {
   } = useCommandCenter();
 
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
-  const mapRef = useRef<maplibregl.Map | null>(null);
-  const markersRef = useRef<maplibregl.Marker[]>([]);
+  const mapRef = useRef<mapboxgl.Map | null>(null);
+  const markersRef = useRef<mapboxgl.Marker[]>([]);
+  const sosMarkersRef = useRef<Map<string, mapboxgl.Marker>>(new Map());
+  const donorMarkersRef = useRef<Map<string, mapboxgl.Marker>>(new Map());
+  const geofenceIdsRef = useRef<Set<string>>(new Set());
 
   const [radiusKm, setRadiusKm] = useState<5 | 10 | 20>(10);
   const [selectedDonorId, setSelectedDonorId] = useState<string>('DNR-8821');
@@ -73,27 +170,81 @@ export const LiveMapPage: React.FC = () => {
   const [callModalOpen, setCallModalOpen] = useState(false);
   const [callStatus, setCallStatus] = useState<'IDLE' | 'CALLING' | 'CONNECTED'>('IDLE');
 
-  const baseActiveDonors = donors.filter(d => d.status === 'EN_ROUTE' || d.status === 'RESPONDED' || d.status === 'ARRIVED_TRIAGE');
-  const { data: liveLocations } = useDonorLocations(baseActiveDonors);
+  const [mapHospital, setMapHospital] = useState<HospitalProfile>(hospital);
+  const [liveRequests, setLiveRequests] = useState<EmergencyRequest[]>(requests);
+  const [liveDonors, setLiveDonors] = useState<Donor[]>(donors);
 
-  // Merge live GPS heartbeat from donor_locations table
-  const activeDonors = baseActiveDonors.map(d => {
-    const live = liveLocations?.find(l => l.donor_id === d.id);
-    if (live && live.latitude && live.longitude) {
-      return {
-        ...d,
-        latitude: live.latitude,
-        longitude: live.longitude
-      };
-    }
-    return d;
-  });
-  const selectedDonor = donors.find(d => d.id === selectedDonorId) || activeDonors[0] || donors[0];
-  const linkedRequest = requests.find(r => r.id === (selectedRequestId || selectedDonor?.requestId)) || requests[0];
+  const activeRequests = liveRequests.filter((request) =>
+    request.status === 'BROADCASTING' ||
+    request.status === 'ACCEPTED' ||
+    request.status === 'DONORS_DISPATCHED'
+  );
+  const activeDonors = liveDonors
+    .filter((donor) => donor.status !== 'CANCELLED' && donor.status !== 'COMPLETED')
+    .map((donor) => ({
+      ...donor,
+      distanceKm: donor.distanceKm || Number(distanceKm(donor.latitude, donor.longitude, mapHospital.latitude, mapHospital.longitude).toFixed(1)),
+      etaMinutes: donor.etaMinutes || Math.max(1, Math.round(distanceKm(donor.latitude, donor.longitude, mapHospital.latitude, mapHospital.longitude) / 0.5))
+    }));
+  const selectedDonor = liveDonors.find(d => d.id === selectedDonorId) || activeDonors[0] || liveDonors[0];
+  const linkedRequest = activeRequests.find(r => r.id === (selectedRequestId || selectedDonor?.requestId)) || activeRequests[0];
 
-  const hospitalCoords: [number, number] = [hospital.longitude, hospital.latitude];
+  const hospitalCoords: [number, number] = [mapHospital.longitude, mapHospital.latitude];
 
-  // Initialize MapLibre GL Map
+  useEffect(() => {
+    let mounted = true;
+    void fetchHospitalProfile(hospital.id).then((profile) => {
+      if (mounted && profile) setMapHospital(profile);
+    });
+    return () => {
+      mounted = false;
+    };
+  }, [hospital.id]);
+
+  useEffect(() => {
+    setLiveRequests(requests);
+  }, [requests]);
+
+  useEffect(() => {
+    setLiveDonors(donors);
+  }, [donors]);
+
+  useEffect(() => {
+    let mounted = true;
+    const refreshRequests = async () => {
+      const nextRequests = await fetchBloodRequests(mapHospital.id);
+      if (mounted && isLiveSupabaseConfigured) setLiveRequests(nextRequests);
+    };
+    const refreshDonors = async () => {
+      const { data, error } = await supabase
+        .from('donors')
+        .select('*');
+      if (error) {
+        console.error('[LiveMap] Donor realtime refresh failed:', error);
+        return;
+      }
+      if (!mounted || !data) return;
+      const nextDonors: Donor[] = (data as DonorRow[])
+        .filter((row) => row.availability === true && isCoordinate(row.latitude) && isCoordinate(row.longitude))
+        .map(toMapDonor);
+      setLiveDonors(nextDonors);
+    };
+
+    const channel = supabase
+      .channel(`live-map-${mapHospital.id || 'hospital'}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'blood_requests' }, () => { void refreshRequests(); })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'donors' }, () => { void refreshDonors(); })
+      .subscribe();
+
+    void refreshRequests();
+    void refreshDonors();
+    return () => {
+      mounted = false;
+      void supabase.removeChannel(channel);
+    };
+  }, [mapHospital.id]);
+
+  // Initialize Mapbox GL Map
   useEffect(() => {
     if (!mapContainerRef.current) return;
 
@@ -102,32 +253,9 @@ export const LiveMapPage: React.FC = () => {
       mapRef.current = null;
     }
 
-    const map = new maplibregl.Map({
+    const map = new mapboxgl.Map({
       container: mapContainerRef.current,
-      style: {
-        version: 8,
-        sources: {
-          'osm-light-tiles': {
-            type: 'raster',
-            tiles: [
-              'https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
-              'https://b.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
-              'https://c.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
-            ],
-            tileSize: 256,
-            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-          }
-        },
-        layers: [
-          {
-            id: 'osm-light-layer',
-            type: 'raster',
-            source: 'osm-light-tiles',
-            minzoom: 0,
-            maxzoom: 19
-          }
-        ]
-      },
+      style: 'mapbox://styles/mapbox/light-v11',
       center: hospitalCoords,
       zoom: 12.8,
       attributionControl: false
@@ -136,76 +264,33 @@ export const LiveMapPage: React.FC = () => {
     mapRef.current = map;
 
     map.on('load', () => {
-      // Radius Circle
-      const circleGeoJSON = createGeoJSONCircle(hospitalCoords, radiusKm);
-      map.addSource('emergency-radius', {
+      map.addSource('donor-route', {
         type: 'geojson',
-        data: circleGeoJSON
+        data: routeFeature(selectedDonor, hospitalCoords)
       });
-
       map.addLayer({
-        id: 'emergency-radius-fill',
-        type: 'fill',
-        source: 'emergency-radius',
-        paint: {
-          'fill-color': '#DC2626',
-          'fill-opacity': 0.04
-        }
-      });
-
-      map.addLayer({
-        id: 'emergency-radius-stroke',
+        id: 'donor-route-line',
         type: 'line',
-        source: 'emergency-radius',
-        paint: {
-          'line-color': '#DC2626',
-          'line-width': 1.8,
-          'line-dasharray': [3, 2]
-        }
+        source: 'donor-route',
+        paint: { 'line-color': '#2563EB', 'line-width': 3, 'line-dasharray': [2, 1] }
       });
-
-      // Donor Route Vector
-      if (selectedDonor) {
-        map.addSource('donor-route', {
-          type: 'geojson',
-          data: {
-            type: 'Feature',
-            geometry: {
-              type: 'LineString',
-              coordinates: [
-                [selectedDonor.longitude, selectedDonor.latitude],
-                hospitalCoords
-              ]
-            },
-            properties: {}
-          }
-        });
-
-        map.addLayer({
-          id: 'donor-route-line',
-          type: 'line',
-          source: 'donor-route',
-          paint: {
-            'line-color': '#2563EB',
-            'line-width': 3,
-            'line-dasharray': [2, 1]
-          }
-        });
-      }
-
       updateMarkers(map);
     });
 
     return () => {
       markersRef.current.forEach(m => m.remove());
       markersRef.current = [];
+      sosMarkersRef.current.clear();
+      donorMarkersRef.current.clear();
       map.remove();
     };
-  }, []);
+  }, [mapHospital.id]);
 
-  const updateMarkers = (map: maplibregl.Map) => {
+  const updateMarkers = (map: mapboxgl.Map) => {
     markersRef.current.forEach(m => m.remove());
     markersRef.current = [];
+    sosMarkersRef.current.clear();
+    donorMarkersRef.current.clear();
 
     // Hospital Beacon Marker
     const hospitalEl = document.createElement('div');
@@ -220,8 +305,9 @@ export const LiveMapPage: React.FC = () => {
       </div>
     `;
 
-    const hospitalMarker = new maplibregl.Marker({ element: hospitalEl })
+    const hospitalMarker = new mapboxgl.Marker({ element: hospitalEl })
       .setLngLat(hospitalCoords)
+      .setPopup(new mapboxgl.Popup({ offset: 24 }).setHTML(hospitalPopup(mapHospital)))
       .addTo(map);
     markersRef.current.push(hospitalMarker);
 
@@ -251,40 +337,111 @@ export const LiveMapPage: React.FC = () => {
         });
       });
 
-      const marker = new maplibregl.Marker({ element: donorEl })
+      const marker = new mapboxgl.Marker({ element: donorEl })
         .setLngLat([donor.longitude, donor.latitude])
+        .setPopup(new mapboxgl.Popup({ offset: 18 }).setHTML(donorPopup(donor, mapHospital)))
         .addTo(map);
       markersRef.current.push(marker);
+      donorMarkersRef.current.set(donor.id, marker);
     });
+
+    activeRequests.forEach((request) => {
+      const color = priorityColor(request.priority);
+      const requestEl = document.createElement('div');
+      requestEl.className = 'w-8 h-8 rounded-full flex items-center justify-center text-white font-black border-2 border-white shadow-lg animate-pulse';
+      requestEl.style.backgroundColor = color;
+      requestEl.textContent = 'SOS';
+      const marker = new mapboxgl.Marker({ element: requestEl })
+        .setLngLat([request.longitude, request.latitude])
+        .setPopup(new mapboxgl.Popup({ offset: 18 }).setHTML(sosPopup(request)))
+        .addTo(map);
+      markersRef.current.push(marker);
+      sosMarkersRef.current.set(request.id, marker);
+
+      const sourceId = `sos-geofence-${request.id}`;
+      const fillId = `${sourceId}-fill`;
+      const lineId = `${sourceId}-line`;
+      const geojson = createGeoJSONCircle([request.longitude, request.latitude], request.broadcastRadiusKm);
+      if (map.getSource(sourceId)) {
+        (map.getSource(sourceId) as mapboxgl.GeoJSONSource).setData(geojson);
+      } else {
+        map.addSource(sourceId, { type: 'geojson', data: geojson });
+        map.addLayer({ id: fillId, type: 'fill', source: sourceId, paint: { 'fill-color': color, 'fill-opacity': 0.14 } });
+        map.addLayer({ id: lineId, type: 'line', source: sourceId, paint: { 'line-color': color, 'line-width': 1.6, 'line-dasharray': [3, 2] } });
+      }
+      geofenceIdsRef.current.add(request.id);
+    });
+
+    geofenceIdsRef.current.forEach((requestId) => {
+      if (activeRequests.some((request) => request.id === requestId)) return;
+      const sourceId = `sos-geofence-${requestId}`;
+      const fillId = `${sourceId}-fill`;
+      const lineId = `${sourceId}-line`;
+      if (map.getLayer(fillId)) map.removeLayer(fillId);
+      if (map.getLayer(lineId)) map.removeLayer(lineId);
+      if (map.getSource(sourceId)) map.removeSource(sourceId);
+      geofenceIdsRef.current.delete(requestId);
+    });
+
+    const nearestDonor = activeDonors.reduce<Donor | undefined>((nearest, donor) => {
+      if (!nearest) return donor;
+      return distanceKm(donor.latitude, donor.longitude, hospitalCoords[1], hospitalCoords[0]) <
+        distanceKm(nearest.latitude, nearest.longitude, hospitalCoords[1], hospitalCoords[0]) ? donor : nearest;
+    }, undefined);
+    if (activeRequests.length > 0) {
+      const bounds = new mapboxgl.LngLatBounds(hospitalCoords, hospitalCoords);
+      activeRequests.forEach((request) => bounds.extend([request.longitude, request.latitude]));
+      if (nearestDonor) bounds.extend([nearestDonor.longitude, nearestDonor.latitude]);
+      map.fitBounds(bounds, { padding: 80, maxZoom: 14, duration: 600 });
+    }
   };
 
   // Synchronize route and radius updates
   useEffect(() => {
     if (!mapRef.current) return;
     const map = mapRef.current;
+    if (!map.isStyleLoaded()) return;
 
-    const radiusSource = map.getSource('emergency-radius') as maplibregl.GeoJSONSource;
-    if (radiusSource) {
-      radiusSource.setData(createGeoJSONCircle(hospitalCoords, radiusKm) as any);
-    }
-
-    const routeSource = map.getSource('donor-route') as maplibregl.GeoJSONSource;
+    const routeSource = map.getSource('donor-route') as mapboxgl.GeoJSONSource;
     if (routeSource && selectedDonor) {
-      routeSource.setData({
-        type: 'Feature',
-        geometry: {
-          type: 'LineString',
-          coordinates: [
-            [selectedDonor.longitude, selectedDonor.latitude],
-            hospitalCoords
-          ]
-        },
-        properties: {}
-      });
+      routeSource.setData(routeFeature(selectedDonor, hospitalCoords));
     }
 
     updateMarkers(map);
-  }, [radiusKm, selectedDonorId, activeDonors.length]);
+  }, [radiusKm, selectedDonorId, activeDonors, activeRequests, mapHospital]);
+
+  useEffect(() => {
+    if (!selectedDonor || !mapboxgl.accessToken) return;
+    const controller = new AbortController();
+    const loadRoute = async () => {
+      const coordinates = `${selectedDonor.longitude},${selectedDonor.latitude};${mapHospital.longitude},${mapHospital.latitude}`;
+      const response = await fetch(
+        `https://api.mapbox.com/directions/v5/mapbox/driving/${coordinates}?geometries=geojson&overview=full&access_token=${mapboxgl.accessToken}`,
+        { signal: controller.signal }
+      );
+      if (!response.ok) {
+        console.warn('[LiveMap] Mapbox route request failed:', response.status);
+        return;
+      }
+      const result = await response.json() as {
+        routes?: Array<{ geometry?: { coordinates?: [number, number][] } }>;
+      };
+      const routeCoordinates = result.routes?.[0]?.geometry?.coordinates;
+      const routeSource = mapRef.current?.getSource('donor-route') as mapboxgl.GeoJSONSource | undefined;
+      if (routeSource && routeCoordinates && routeCoordinates.length > 1) {
+        routeSource.setData({
+          type: 'Feature',
+          geometry: { type: 'LineString', coordinates: routeCoordinates },
+          properties: {}
+        });
+      }
+    };
+    void loadRoute().catch((error: unknown) => {
+      if (error instanceof DOMException && error.name === 'AbortError') return;
+      console.error('[LiveMap] Mapbox route error:', error);
+    });
+    return () => controller.abort();
+  }, [selectedDonor?.id, selectedDonor?.latitude, selectedDonor?.longitude, mapHospital.latitude, mapHospital.longitude]);
 
   const handleZoomIn = () => mapRef.current?.zoomIn();
   const handleZoomOut = () => mapRef.current?.zoomOut();
@@ -348,10 +505,10 @@ export const LiveMapPage: React.FC = () => {
       {/* REAL MAP CANVAS CONTAINER */}
       <div className="relative rounded-[28px] border border-[#E5E7EB] overflow-hidden shadow-[0_2px_12px_rgba(0,0,0,0.02)] bg-slate-100 h-[60vh] lg:h-[70vh]">
         
-        {/* MapLibre DOM Node */}
+        {/* Mapbox DOM Node */}
         <div 
           ref={mapContainerRef} 
-          id="maplibre-canvas"
+          id="mapbox-canvas"
           className="w-full h-full"
         />
 

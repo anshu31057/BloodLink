@@ -12,6 +12,7 @@ export type EmergencyCategory =
 
 export type RequestStatus = 
   | 'BROADCASTING'
+  | 'ACCEPTED'
   | 'DONORS_DISPATCHED'
   | 'PARTIALLY_FULFILLED'
   | 'FULFILLED'
