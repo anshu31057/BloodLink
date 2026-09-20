@@ -1,0 +1,6 @@
+{
+  "name": "BloodLink 8",
+  "description": "8 Blood Groups. One Lifeline. Official Hospital Emergency Command Center for the national emergency blood response network.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
